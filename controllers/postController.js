@@ -1,9 +1,8 @@
 const allPosts = require('../mock/posts');
-
 const boostedPosts = [];
 
 const createPost = (req, res) => {
-  const { title, description, price, category, isFree, college, postedBy } = req.body;
+  const { title, description, price, category, isFree, college, postedBy, tags } = req.body;
 
   const mockPost = {
     title,
@@ -14,7 +13,12 @@ const createPost = (req, res) => {
     status: 'available',
     college,
     postedBy,
+    tags: tags || [],
+    verified: true, // mock
+    visibility: 'public',
+    region: 'central', // mock
     datePosted: new Date(),
+    expiresAt: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000),
   };
 
   return res.status(201).json({
@@ -25,7 +29,6 @@ const createPost = (req, res) => {
 
 const getPostsByCollege = (req, res) => {
   const collegeName = req.params.collegeName;
-
   return res.status(200).json({
     message: `Posts for ${collegeName}`,
     posts: allPosts.filter((post) => post.college === collegeName),
@@ -56,7 +59,7 @@ const boostPost = (req, res) => {
   const { postId } = req.params;
   const { boostLevel } = req.body;
 
-  const validLevels = ["college", "regional", "national"];
+  const validLevels = ['college', 'regional', 'national'];
   if (!validLevels.includes(boostLevel)) {
     return res.status(400).json({ message: 'Invalid boost level' });
   }
@@ -92,56 +95,122 @@ const getBoostedPostsByScope = (req, res) => {
 };
 
 const searchPosts = (req, res) => {
-  const { keyword, college, region } = req.query;
+  const {
+    keyword = '',
+    college,
+    region,
+    minPrice,
+    maxPrice,
+    isFree,
+    category,
+    tags,
+    sortBy = 'newest',
+    verifiedOnly,
+    page = 1,
+    limit = 10,
+  } = req.query;
 
-  if (!keyword || !college || !region) {
-    return res.status(400).json({ message: 'Keyword, college, and region are required' });
+  if (!college || !region) {
+    return res.status(400).json({ message: 'College and region are required' });
   }
 
   const keywordLower = keyword.toLowerCase();
+  const tagArray = tags ? tags.split(',').map((t) => t.trim().toLowerCase()) : [];
 
-  const collegeResults = allPosts.filter(
-    (post) =>
-      post.college === college &&
-      (post.title.toLowerCase().includes(keywordLower) ||
-       post.description.toLowerCase().includes(keywordLower))
-  );
+  const now = new Date();
+  const baseFilter = (post) => {
+    const matchesCollege = post.college === college;
+    const matchesRegion = post.region === region;
+    const matchesKeyword =
+      post.title.toLowerCase().includes(keywordLower) ||
+      post.description.toLowerCase().includes(keywordLower);
+    const matchesFree = isFree === undefined || post.isFree === (isFree === 'true');
+    const matchesCategory = !category || post.category.toLowerCase() === category.toLowerCase();
+    const matchesPrice =
+      (!minPrice || post.price >= parseInt(minPrice)) &&
+      (!maxPrice || post.price <= parseInt(maxPrice));
+    const matchesVerified = !verifiedOnly || post.verified === true;
+    const matchesVisibility = post.visibility !== 'hidden';
+    const notExpired = !post.expiresAt || new Date(post.expiresAt) > now;
+    const matchesTags =
+      tagArray.length === 0 ||
+      (post.tags && post.tags.some((tag) => tagArray.includes(tag.toLowerCase())));
 
-  if (collegeResults.length > 0) {
+    return (
+      matchesKeyword &&
+      matchesFree &&
+      matchesCategory &&
+      matchesPrice &&
+      matchesVerified &&
+      matchesVisibility &&
+      notExpired &&
+      matchesTags &&
+      matchesCollege
+    );
+  };
+
+  const fallbackFilter = (scope) => (post) => {
+    const matchesScope = scope === 'region'
+      ? post.region === region && post.college !== college
+      : post.college !== college;
+
+    return baseFilter({ ...post, college: post.college }) && matchesScope;
+  };
+
+  const sortPosts = (posts) => {
+    return posts.sort((a, b) => {
+      if (sortBy === 'lowest') return a.price - b.price;
+      if (sortBy === 'highest') return b.price - a.price;
+      return new Date(b.datePosted) - new Date(a.datePosted);
+    });
+  };
+
+  const paginate = (posts) => {
+    const start = (parseInt(page) - 1) * parseInt(limit);
+    const end = start + parseInt(limit);
+    return posts.slice(start, end);
+  };
+
+  const matchedBoosted = boostedPosts
+    .filter((b) => new Date(b.expiresAt) > now)
+    .map((b) => allPosts.find((p) => p.id === b.postId))
+    .filter((post) => post && baseFilter(post));
+
+  let filtered = allPosts.filter(baseFilter);
+  if (filtered.length === 0) {
+    const regionFallback = allPosts.filter(fallbackFilter('region'));
+    if (regionFallback.length > 0) {
+      return res.status(200).json({
+        message: `No results in ${college}. Showing results from nearby colleges.`,
+        boostedPosts: matchedBoosted,
+        normalPosts: paginate(sortPosts(regionFallback)),
+        totalResults: regionFallback.length,
+        page: parseInt(page),
+        fallback: 'nearby',
+      });
+    }
+
+    const nationalFallback = allPosts.filter(fallbackFilter('national'));
     return res.status(200).json({
-      message: `Search results for "${keyword}" in ${college}`,
-      results: collegeResults,
-      fallback: null,
+      message: `No results in ${college} or nearby colleges. Showing national results.`,
+      boostedPosts: matchedBoosted,
+      normalPosts: paginate(sortPosts(nationalFallback)),
+      totalResults: nationalFallback.length,
+      page: parseInt(page),
+      fallback: 'national',
     });
   }
 
-  // Fallback: Nearby colleges
-  const nearbyResults = allPosts.filter(
-    (post) =>
-      post.college !== college &&
-      post.region === region &&
-      post.title.toLowerCase().includes(keywordLower)
-  );
-
-  if (nearbyResults.length > 0) {
-    return res.status(200).json({
-      message: `No results in ${college}. Showing results from nearby colleges.`,
-      results: nearbyResults,
-      fallback: 'nearby',
-    });
-  }
-
-  // Fallback: National level
-  const nationalResults = allPosts.filter(
-    (post) =>
-      post.college !== college &&
-      post.title.toLowerCase().includes(keywordLower)
-  );
+  const sorted = sortPosts(filtered);
+  const paginated = paginate(sorted);
 
   return res.status(200).json({
-    message: `No results in ${college} or nearby colleges. Showing national results.`,
-    results: nationalResults,
-    fallback: 'national',
+    message: `Search results for "${keyword}" in ${college}`,
+    boostedPosts: matchedBoosted,
+    normalPosts: paginated,
+    totalResults: filtered.length,
+    page: parseInt(page),
+    fallback: null,
   });
 };
 
